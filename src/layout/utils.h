@@ -90,6 +90,31 @@ Array<IterVar> ToIterVars(const Map<Var, Range> &vmap);
 Fragment ComputeReducerLayout(const Fragment &src_layout, int dim);
 
 /*!
+ * \brief Infer a source fragment layout for a reduction whose destination
+ *        layout is already fixed.
+ *
+ * This is the inverse of \ref ComputeReducerLayout, used when the reduced
+ * buffer is free but its destination was constrained by consumers. The returned
+ * layout owns each source element on the thread that holds the corresponding
+ * destination element in `dst_layout`, so reducing it yields a layout that
+ * contains the destination.
+ *
+ * Only layouts that a reduction can express are accepted: the destination
+ * replicate extent must divide the reduction extent, so that reducing the
+ * source at replicate zero covers every destination replica. Returns
+ * std::nullopt otherwise, leaving the caller's existing behaviour untouched.
+ *
+ * \param dst_layout The fixed destination layout.
+ * \param src_shape The logical shape of the source buffer.
+ * \param dim The reduction axis in `src_shape`.
+ * \param analyzer Analyzer for shape/expression proofs.
+ */
+std::optional<Fragment>
+InferReducerSourceLayout(const Fragment &dst_layout,
+                         const Array<PrimExpr> &src_shape, int dim,
+                         arith::Analyzer *analyzer);
+
+/*!
  * \brief Check whether the threads that access elements of a smaller fragment
  *        are a subset of the threads that access elements of a larger fragment.
  *

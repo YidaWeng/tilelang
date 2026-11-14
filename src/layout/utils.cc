@@ -47,6 +47,75 @@ Fragment ComputeReducerLayout(const Fragment &src_layout, int dim) {
       ->BindThreadRange(src_layout->ThreadRange());
 }
 
+std::optional<Fragment>
+InferReducerSourceLayout(const Fragment &dst_layout,
+                         const Array<PrimExpr> &src_shape, int dim,
+                         arith::Analyzer *analyzer) {
+  ICHECK_GE(dim, 0) << "ReduceOp: reduction axis must be non-negative";
+  ICHECK_LT(dim, static_cast<int>(src_shape.size()))
+      << "ReduceOp: reduction axis exceeds the source rank";
+
+  // ComputeReducerLayout drops `dim`; a rank-one reduction keeps one synthetic
+  // unit input, mirroring the destination-shape contract in ReduceOpNode.
+  Array<PrimExpr> reduced_shape = src_shape;
+  PrimExpr reduce_extent = src_shape[dim];
+  reduced_shape.erase(reduced_shape.begin() + dim);
+  if (reduced_shape.empty()) {
+    reduced_shape.push_back(1);
+  }
+
+  Fragment dst = dst_layout;
+  if (dst->InputDim() == reduced_shape.size()) {
+    for (size_t i = 0; i < reduced_shape.size(); ++i) {
+      if (!analyzer->CanProveEqual(dst->InputShape()[i], reduced_shape[i])) {
+        return std::nullopt;
+      }
+    }
+  } else if (dst->InputDim() == src_shape.size()) {
+    // Keep-dim destination form: the reduced axis survives with extent one.
+    if (!analyzer->CanProveEqual(dst->InputShape()[dim], 1)) {
+      return std::nullopt;
+    }
+    try {
+      dst = Downcast<Fragment>(dst->Reshape(reduced_shape, analyzer));
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+
+  // Reducing the inferred source at replicate `r` maps to destination
+  // replicate `r % ReplicateExtent()`, so every destination replica is reached
+  // exactly when the reduction extent spans the destination replication.
+  const int64_t *extent = as_const_int(reduce_extent);
+  const int64_t *replicas = as_const_int(dst->ReplicateExtent());
+  if (extent == nullptr || replicas == nullptr || *replicas <= 0 ||
+      *extent < *replicas || *extent % *replicas != 0) {
+    return std::nullopt;
+  }
+
+  Array<PrimExpr> indices;
+  indices.reserve(src_shape.size());
+  for (size_t i = 0; i < src_shape.size(); ++i) {
+    indices.push_back(InputPlaceholder(i));
+  }
+  Array<PrimExpr> dst_indices;
+  dst_indices.reserve(reduced_shape.size());
+  for (size_t i = 0; i < src_shape.size(); ++i) {
+    if (static_cast<int>(i) != dim) {
+      dst_indices.push_back(indices[i]);
+    }
+  }
+
+  PrimExpr thread = dst->ForwardThread(
+      dst_indices, FloorMod(indices[dim], dst->ReplicateExtent()));
+  // An empty forward index lets the fragment infer compact per-thread slots,
+  // which is exactly the local storage the reduction consumes.
+  return Fragment(src_shape, {}, thread, 1, std::nullopt)
+      ->BindThreadRange(dst->ThreadRange());
+}
+
 std::optional<int64_t> EvaluateConstantInteger(const PrimExpr &expr) {
   if (const int64_t *constant = as_const_int(expr)) {
     return *constant;

@@ -190,8 +190,10 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &layout_args,
   if (level >= InferLevel::kStrict)
     return {};
 
-  if (IsFragmentBuffer(src) && IsFragmentBuffer(dst) &&
-      layout_args.layout_map.count(src)) {
+  if (!IsFragmentBuffer(src) || !IsFragmentBuffer(dst))
+    return {};
+
+  if (layout_args.layout_map.count(src)) {
     auto src_layout = layout_args.layout_map[src].as<Fragment>().value();
     auto reducer_layout = ComputeReducerLayout(src_layout, this->dim);
 
@@ -241,6 +243,19 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &layout_args,
           << "You may need to use a shared memory to transform the "
              "layout";
       throw LayoutConflictException(oss.str());
+    }
+  } else if (level == InferLevel::kFree && layout_args.layout_map.count(dst)) {
+    // The destination was already fixed by its consumers while the source is
+    // still free: let it adopt a layout that reduces onto the destination.
+    // Without this the source follows its producer loop and the two halves of
+    // the component can be mutually inconsistent (#4056).
+    auto dst_layout = layout_args.layout_map[dst].as<Fragment>();
+    if (dst_layout.has_value()) {
+      auto src_layout = InferReducerSourceLayout(
+          dst_layout.value(), src->shape, this->dim, layout_args.analyzer);
+      if (src_layout.has_value()) {
+        return {{src, src_layout.value()}};
+      }
     }
   }
   return {};
