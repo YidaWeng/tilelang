@@ -1971,6 +1971,16 @@ private:
       adjusted_extent = loop->extent - step;
     }
 
+    // The guards collected from the loop body are expressed in the iteration
+    // variable of the current iteration. Shift the "next iteration" side too,
+    // not just its indices: the two arms of `if k % 2 == 0 / else` are mutually
+    // exclusive under one `k`, but consecutive iterations execute both, and
+    // without the shift the merged premises are either contradictory (nothing
+    // is a hazard) or identical (both accesses look like one thread's pair).
+    ConstrSet prev_cset{prev.cset};
+    ConstrSet curr_cset =
+        loop != nullptr ? curr.cset.Substitute(loop_shift_sub) : curr.cset;
+
     // Check if indices are the same (considering loop shift)
     bool has_same_index = true;
     for (size_t i = 0; i < prev.buffer_indices.size(); i++) {
@@ -1997,8 +2007,8 @@ private:
       // Use Z3 to check if prev and curr constraints are equivalent.
       // If equivalent, the same set of threads execute both accesses, so no
       // sync is needed.
-      PrimExpr prev_constr = prev.cset.ToConjunction();
-      PrimExpr curr_constr = curr.cset.ToConjunction();
+      PrimExpr prev_constr = prev_cset.ToConjunction();
+      PrimExpr curr_constr = curr_cset.ToConjunction();
 
       arith::Analyzer analyzer;
       for (const auto &iv : prev.threads) {
@@ -2049,8 +2059,6 @@ private:
       PrimExpr prev_indice_bytes = prev_indice * prev_dtype.bytes();
       PrimExpr curr_indice_bytes = curr_indice * curr_dtype.bytes();
 
-      ConstrSet prev_cset{prev.cset};
-      ConstrSet curr_cset{curr.cset};
       arith::Analyzer analyzer;
 
       // Add loop variable constraint for loop-carry analysis
@@ -2158,14 +2166,20 @@ private:
             analyzer.CanProve(tirx::NE(prev_indice_bytes, curr_indice_bytes));
       } else {
         try {
+          PrimExpr curr_touched_min = curr.touched[i].min();
+          PrimExpr curr_touched_max = curr.touched[i].max();
+          if (loop != nullptr) {
+            curr_touched_min = Substitute(curr_touched_min, loop_shift_sub);
+            curr_touched_max = Substitute(curr_touched_max, loop_shift_sub);
+          }
           auto prev_min = analyzer.Simplify(
               Substitute(prev.touched[i].min() * prev_dtype.bytes(), prev_sub));
           auto prev_max = analyzer.Simplify(
               Substitute(prev.touched[i].max() * prev_dtype.bytes(), prev_sub));
           auto curr_min = analyzer.Simplify(
-              Substitute(curr.touched[i].min() * curr_dtype.bytes(), curr_sub));
+              Substitute(curr_touched_min * curr_dtype.bytes(), curr_sub));
           auto curr_max = analyzer.Simplify(
-              Substitute(curr.touched[i].max() * curr_dtype.bytes(), curr_sub));
+              Substitute(curr_touched_max * curr_dtype.bytes(), curr_sub));
           provably_disjoint = analyzer.CanProve(analyzer.Simplify(
               tirx::Or(prev_min > curr_max, curr_min > prev_max)));
         } catch (const std::exception &e) {

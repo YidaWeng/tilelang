@@ -674,6 +674,77 @@ def test_loop_carry_modulo_buffering():
     assert not _storage_syncs(lowered)
 
 
+def test_loop_carry_across_if_else_double_buffer_arms():
+    """Alternating arms of a double-buffered loop still need a loop barrier.
+
+    Iteration ``k`` reads tile ``B0`` in the ``k % 2 == 0`` arm, and iteration
+    ``k + 1`` writes ``B0`` in the else arm.  The two guards look mutually
+    exclusive when both are read under the same ``k``, so the loop-carried
+    analysis used to see no dependence at all and emitted no barrier, which is
+    the miscompile in #3938.  The next-iteration guard has to be shifted with
+    its index before the pair is compared.
+    """
+
+    @T.prim_func(private=True)
+    def func():
+        B0 = T.alloc_buffer((128,), dtype="float32", scope="shared")
+        B1 = T.alloc_buffer((128,), dtype="float32", scope="shared")
+        result_local = T.alloc_buffer((1,), dtype="float32", scope="local")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        result_local[0] = T.float32(0)
+        for k in range(8):
+            if k % 2 == 0:
+                if k + 1 < 8:
+                    B1[tx] = T.float32(k + 1)
+                result_local[0] = result_local[0] + B0[(tx + 1) % 128]
+            else:
+                if k + 1 < 8:
+                    B0[tx] = T.float32(k + 1)
+                result_local[0] = result_local[0] + B1[(tx + 1) % 128]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared")(mod)
+    lowered = mod["main"]
+    loops = collect_nodes(lowered, tirx.For)
+    assert len(loops) == 1
+    loop = loops[0]
+    syncs = _storage_syncs(loop)
+    assert len(syncs) == 1, "the two arms of consecutive iterations need one loop-carried barrier"
+    guard = _guard(loop.body, loop.loop_var % 2 == 0)
+    # The prefetch writes must not start until the previous iteration's reads
+    # finished, so the barrier goes before the branch.
+    _assert_stmt_order(loop.body, _sync_stmt(loop, syncs[0]), guard)
+
+
+def test_loop_carry_across_if_else_arms_stays_thread_private():
+    """The same alternation is barrier-free when every thread owns its slot."""
+
+    @T.prim_func(private=True)
+    def func():
+        B0 = T.alloc_buffer((128,), dtype="float32", scope="shared")
+        B1 = T.alloc_buffer((128,), dtype="float32", scope="shared")
+        result_local = T.alloc_buffer((1,), dtype="float32", scope="local")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        result_local[0] = T.float32(0)
+        for k in range(8):
+            if k % 2 == 0:
+                B1[tx] = T.float32(k + 1)
+                result_local[0] = result_local[0] + B0[tx]
+            else:
+                B0[tx] = T.float32(k + 1)
+                result_local[0] = result_local[0] + B1[tx]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared")(mod)
+    assert not _storage_syncs(mod["main"])
+
+
 @tilelang.testing.requires_cuda
 def test_loop_carry_different_indices():
     """Test that A[i] write followed by A[i+1] read does NOT need barrier.
